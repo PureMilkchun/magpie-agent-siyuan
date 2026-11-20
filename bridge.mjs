@@ -10,6 +10,7 @@ export const siyuanHome = join(homedir(), ".config", "siyuan")
 const nodeID = /^\d{14}-[a-z0-9]{7}$/
 const logoVersion = 1
 const logoSnippetName = "Magpie 提供商图标"
+const pendingSnippetRefresh = new Set()
 
 function newID() {
   const timestamp = new Date().toISOString().slice(0, 19).replace(/\D/g, "")
@@ -174,15 +175,14 @@ async function readAI(kernel) {
   return { ai, revision: data.revision }
 }
 
-async function syncProviderLogo(kernel, providerId, connected) {
+async function syncProviderLogo(kernel, providerId, connected, isCurrent) {
   const { snippets, revision } = await kernel.call("/api/snippet/getSnippet", { type: "all", enabled: 2 })
   if (!Array.isArray(snippets) || !revision) throw new Error("无法读取思源 CSS 片段版本")
   const existing = snippets.find(snippet => snippet.id === providerId)
   if (existing && (existing.name !== logoSnippetName || existing.type !== "css")) {
     if (connected) throw new Error("Magpie 图标的 CSS 片段 ID 已被占用")
-    return
+    return true
   }
-  if (!connected && !existing) return
 
   let next = snippets.filter(snippet => snippet.id !== providerId)
   if (connected) {
@@ -201,15 +201,21 @@ ${avatar}::before {
       enabled: existing?.enabled ?? true, disabledInPublish: true }
     next = existing ? snippets.map(item => item.id === providerId ? snippet : item) : [...snippets, snippet]
   }
-  if (!isDeepStrictEqual(next, snippets)) {
-    await kernel.call("/api/snippet/setSnippet", { snippets: next, revision })
-  }
-  // A nonempty settings patch triggers the kernel's live snippet refresh.
-  // Reuse the current CSS switch and leave the JavaScript switch out.
+  const changed = !isDeepStrictEqual(next, snippets)
+  if (!changed && !pendingSnippetRefresh.has(kernel.workspace)) return true
   const settings = await kernel.call("/api/setting/getSection", { namespace: "snippet" })
   const enabledCSS = settings?.conf?.snippet?.enabledCSS
   if (typeof enabledCSS !== "boolean") throw new Error("无法读取思源 CSS 片段开关")
+  if (!await isCurrent()) return false
+  if (changed) {
+    await kernel.call("/api/snippet/setSnippet", { snippets: next, revision })
+    pendingSnippetRefresh.add(kernel.workspace)
+  }
+  // A nonempty settings patch triggers the kernel's live snippet refresh.
+  // Reuse the current CSS switch and leave the JavaScript switch out.
   await kernel.call("/api/setting/patch", { snippet: { enabledCSS } })
+  pendingSnippetRefresh.delete(kernel.workspace)
+  return true
 }
 
 async function updateAI(kernel, { ai, revision }, state, connection, isCurrent) {
@@ -240,7 +246,7 @@ async function updateAI(kernel, { ai, revision }, state, connection, isCurrent) 
   return true
 }
 
-export async function syncSiyuan(home, { restoreOnly = false } = {}) {
+export async function syncSiyuan(home, { restoreOnly = false, checkLogo = true } = {}) {
   const controlHome = home ?? siyuanHome
   const dir = join(controlHome, "magpie")
   const connectionFile = join(dir, "connection.json")
@@ -258,7 +264,7 @@ export async function syncSiyuan(home, { restoreOnly = false } = {}) {
     throw new Error("恢复记录无法识别，已保留该记录")
   }
   const modelApplied = connection && state?.applied === signature
-  if (modelApplied && state.logoVersion === logoVersion) return "connected"
+  if (modelApplied && state.logoVersion === logoVersion && !checkLogo) return "connected"
   // SiYuan's --home-dir selects the base for its .config/siyuan registry.
   // Magpie's agent manifest still writes its control file in the user's home.
   const customHome = home === undefined && process.env.SIYUAN_HOME_DIR
@@ -287,10 +293,12 @@ export async function syncSiyuan(home, { restoreOnly = false } = {}) {
     }
   }
 
-  if (!await isCurrent()) return "changed"
-  if (!connection || state.logoVersion !== logoVersion) {
-    await syncProviderLogo(kernel, state.providerId, Boolean(connection))
+  // The CSS snippet file is synced by SiYuan. A different device's copy can
+  // replace this workspace's snippet even when the local model is up to date.
+  if (!connection || state.logoVersion !== logoVersion || checkLogo) {
+    if (!await syncProviderLogo(kernel, state.providerId, Boolean(connection), isCurrent)) return "changed"
   }
+  if (!await isCurrent()) return "changed"
   if (connection) {
     if (state.logoVersion !== logoVersion) await saveState(stateFile, { ...state, logoVersion })
     return "connected"

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url"
 import { syncSiyuan } from "./bridge.mjs"
 
 let started = false
+const logoCheckInterval = 10_000
 
 export default function SiYuan({ directory }) {
   if (started) return {}
@@ -12,6 +13,7 @@ export default function SiYuan({ directory }) {
 
   let lastMessage = ""
   let ownsGateway = false
+  let nextLogoCheck = 0
   async function tick() {
     try {
       if (!ownsGateway) {
@@ -21,7 +23,9 @@ export default function SiYuan({ directory }) {
         ownsGateway = gateway?.pid === process.ppid
         if (!ownsGateway) return
       }
-      const result = await syncSiyuan()
+      const checkLogo = Date.now() >= nextLogoCheck
+      if (checkLogo) nextLogoCheck = Date.now() + logoCheckInterval
+      const result = await syncSiyuan(undefined, { checkLogo })
       if (result !== lastMessage) {
         if (result === "connected") console.info("[siyuan] 已同步智能体模型")
         if (result === "restored") console.info("[siyuan] 已撤销智能体的 Magpie 配置")

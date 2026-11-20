@@ -30,7 +30,7 @@ test("both Magpie surfaces reference the bundled SiYuan icon", async () => {
   assert.equal(agent.icon, "data:image/svg+xml;base64," + Buffer.from(svg).toString("base64"))
 })
 
-test("retries an interrupted disconnect against the original workspace", { timeout: 15_000 }, async t => {
+test("repairs a synced logo and retries disconnect against the original workspace", { timeout: 30_000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), "magpie siyuan "))
   t.after(() => rm(root, { recursive: true, force: true }))
   const home = join(root, ".config", "siyuan")
@@ -57,6 +57,7 @@ test("retries an interrupted disconnect against the original workspace", { timeo
   let patches = 0
   let snippetRevision = 0
   let snippetRefreshes = 0
+  let failSnippetRefresh = false
   const userSnippet = { id: "user", type: "css", content: "body {}", enabled: false }
   let snippets = [userSnippet]
   const server = createServer(async (request, response) => {
@@ -86,6 +87,7 @@ test("retries an interrupted disconnect against the original workspace", { timeo
     assert.equal(request.url, "/api/setting/patch")
     if (body.snippet) {
       assert.deepEqual(body, { snippet: { enabledCSS: false } })
+      if (failSnippetRefresh) return reply(-1, null)
       snippetRefreshes++
       return reply(0, null)
     }
@@ -135,6 +137,34 @@ test("retries an interrupted disconnect against the original workspace", { timeo
   assert.equal(ai.agent.modelId, "local-model")
   assert.equal(patches, 1)
   assert.deepEqual(snippets, [userSnippet, logo])
+
+  // Simulate a cloud checkout from another device with its own provider ID.
+  const otherId = "20261120000000-aaaaaaa"
+  const syncedLogo = { ...logo, id: otherId, content: logo.content.replaceAll(added.id, otherId) }
+  snippets = [userSnippet, syncedLogo]
+  snippetRevision++
+  assert.equal(await syncSiyuan(home, { checkLogo: false }), "connected")
+  assert.deepEqual(snippets, [userSnippet, syncedLogo])
+
+  failSnippetRefresh = true
+  await assert.rejects(syncSiyuan(home), /\/api\/setting\/patch/)
+  assert.deepEqual(snippets, [userSnippet, syncedLogo, logo])
+  const repairedRevision = snippetRevision
+  failSnippetRefresh = false
+  assert.equal(await syncSiyuan(home), "connected")
+  assert.equal(snippetRefreshes, 3)
+  assert.equal(snippetRevision, repairedRevision)
+
+  // The next check leaves the existing snippet's switch and config intact.
+  const disabledLogo = { ...logo, enabled: false }
+  snippets = [userSnippet, syncedLogo, disabledLogo]
+  snippetRevision++
+  assert.equal(await syncSiyuan(home), "connected")
+  assert.equal(snippetRevision, repairedRevision + 1)
+  assert.equal(snippetRefreshes, 3)
+  assert.deepEqual(snippets, [userSnippet, syncedLogo, disabledLogo])
+  assert.equal(ai.agent.modelId, "local-model")
+  assert.equal(patches, 1)
   ai.agent.modelId = added.models[0].id
 
   await rm(connection)
@@ -165,13 +195,13 @@ test("retries an interrupted disconnect against the original workspace", { timeo
       NODE_USE_ENV_PROXY: "1",
     },
     stdio: ["ignore", "ignore", "inherit"],
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(25_000),
     windowsHide: true,
   })
   assert.deepEqual(await once(restore, "exit"), [0, null])
   assert.deepEqual(ai.providers, [original, another])
   assert.deepEqual(ai.agent, { modelId: "local-model", temperature: 0.8 })
-  assert.deepEqual(snippets, [userSnippet])
-  assert.equal(snippetRefreshes, 3)
+  assert.deepEqual(snippets, [userSnippet, syncedLogo])
+  assert.equal(snippetRefreshes, 4)
   assert.equal(await syncSiyuan(home), "idle")
 })
