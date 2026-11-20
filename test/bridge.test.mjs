@@ -1,10 +1,12 @@
 import assert from "node:assert/strict"
+import { spawn } from "node:child_process"
 import { once } from "node:events"
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
+import { fileURLToPath } from "node:url"
 import { syncSiyuan } from "../bridge.mjs"
 import { agent, connect } from "../siyuan.agent.js"
 
@@ -23,14 +25,16 @@ test("Magpie writes a chat-compatible gateway connection for a routing group", (
 test("both Magpie surfaces reference the bundled SiYuan icon", async () => {
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url)))
   const asset = await readFile(new URL("../assets/siyuan.svg", import.meta.url), "utf8")
-  const svg = asset.slice(asset.indexOf("<svg")).trim()
+  const svg = asset.slice(asset.indexOf("<svg")).replace(/\r\n/g, "\n").trim()
   assert.equal(pkg.magpie.icon, agent.icon)
   assert.equal(agent.icon, "data:image/svg+xml;base64," + Buffer.from(svg).toString("base64"))
 })
 
-test("retries an interrupted disconnect against the original workspace", async t => {
-  const home = await mkdtemp(join(tmpdir(), "magpie-siyuan-"))
-  const workspace = await realpath(home)
+test("retries an interrupted disconnect against the original workspace", { timeout: 15_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), "magpie siyuan "))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const home = join(root, ".config", "siyuan")
+  const workspace = await realpath(root)
   const dir = join(home, "magpie")
   const connection = join(dir, "connection.json")
   const state = join(dir, "state.json")
@@ -38,11 +42,10 @@ test("retries an interrupted disconnect against the original workspace", async t
   const registry = join(home, "workspace.json")
   const write = (path, value) => writeFile(path, JSON.stringify(value))
 
-  await mkdir(dir)
+  await mkdir(dir, { recursive: true })
   await mkdir(join(workspace, "conf"))
   await write(join(workspace, "conf", "conf.json"), { api: { token: "fixture-token" } })
   await write(registry, [workspace])
-  t.after(() => rm(home, { recursive: true, force: true }))
 
   const original = { id: "local", apiKey: "original-fixture", models: [{ id: "local-model" }] }
   const ai = {
@@ -140,11 +143,32 @@ test("retries an interrupted disconnect against the original workspace", async t
   await assert.rejects(syncSiyuan(home), /等待目标思源工作区/)
   assert.equal(ai.agent.modelId, added.models[0].id)
 
-  await write(ports, running)
   ai.agent.temperature = 0.8
   const another = { id: "another", models: [{ id: "another-model" }] }
   ai.providers.push(another)
-  assert.equal(await syncSiyuan(home, { restoreOnly: true }), "restored")
+
+  // Restore with the standalone CLI, a custom kernel home and a PowerShell
+  // UTF-8 BOM. Loopback must work even when an environment proxy is unusable.
+  const customHome = join(root, "思源用户目录")
+  const customRegistry = join(customHome, ".config", "siyuan")
+  await mkdir(customRegistry, { recursive: true })
+  await writeFile(join(customRegistry, "port.json"), "\uFEFF" + JSON.stringify(running))
+  const bridge = fileURLToPath(new URL("../bridge.mjs", import.meta.url))
+  const restore = spawn(process.execPath, [bridge, "restore"], {
+    env: {
+      ...process.env,
+      HOME: root,
+      USERPROFILE: root,
+      SIYUAN_HOME_DIR: customHome,
+      HTTP_PROXY: "http://127.0.0.1:1",
+      NO_PROXY: "",
+      NODE_USE_ENV_PROXY: "1",
+    },
+    stdio: ["ignore", "ignore", "inherit"],
+    signal: AbortSignal.timeout(10_000),
+    windowsHide: true,
+  })
+  assert.deepEqual(await once(restore, "exit"), [0, null])
   assert.deepEqual(ai.providers, [original, another])
   assert.deepEqual(ai.agent, { modelId: "local-model", temperature: 0.8 })
   assert.deepEqual(snippets, [userSnippet])

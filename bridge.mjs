@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { readFile, mkdir, realpath, rename, rm, writeFile } from "node:fs/promises"
+import { request as httpRequest } from "node:http"
 import { homedir } from "node:os"
 import { isAbsolute, join, normalize } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -17,7 +18,8 @@ function newID() {
 
 async function readJSON(file) {
   try {
-    return JSON.parse(await readFile(file, "utf8"))
+    const content = await readFile(file, "utf8")
+    return JSON.parse(content.replace(/^\uFEFF/, ""))
   } catch (error) {
     if (error.code === "ENOENT") return null
     // JSON parser messages can contain snippets of keys and tokens.
@@ -49,18 +51,39 @@ async function readConnection(file) {
 }
 
 async function request(port, endpoint, body = {}, token = "") {
-  const response = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
-    method: "POST",
-    redirect: "error",
-    signal: AbortSignal.timeout(1800),
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Token ${token}` } : {}),
-    },
-    body: JSON.stringify(body),
+  const payload = JSON.stringify(body)
+  const response = await new Promise((resolve, reject) => {
+    // The kernel is local. Bypass environment proxies, including when the
+    // bridge runs outside Magpie's host for a manual or shutdown restore.
+    const req = httpRequest({
+      hostname: "127.0.0.1",
+      port,
+      path: endpoint,
+      method: "POST",
+      agent: false,
+      signal: AbortSignal.timeout(1800),
+      headers: {
+        Connection: "close",
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+        ...(token ? { Authorization: `Token ${token}` } : {}),
+      },
+    }, resolve)
+    req.on("error", reject)
+    req.end(payload)
   })
-  if (!response.ok) throw new Error(`思源接口 ${endpoint} 返回 HTTP ${response.status}`)
-  const result = await response.json().catch(() => null)
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    response.destroy()
+    throw new Error(`思源接口 ${endpoint} 返回 HTTP ${response.statusCode}`)
+  }
+  const chunks = []
+  for await (const chunk of response) chunks.push(chunk)
+  let result
+  try {
+    result = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+  } catch {
+    // Use the endpoint error below without logging any response content.
+  }
   if (result?.code !== 0) {
     throw new Error(`思源接口 ${endpoint} 拒绝了请求，请检查 API Token 和工作区的读写状态`)
   }
@@ -217,8 +240,9 @@ async function updateAI(kernel, { ai, revision }, state, connection, isCurrent) 
   return true
 }
 
-export async function syncSiyuan(home = siyuanHome, { restoreOnly = false } = {}) {
-  const dir = join(home, "magpie")
+export async function syncSiyuan(home, { restoreOnly = false } = {}) {
+  const controlHome = home ?? siyuanHome
+  const dir = join(controlHome, "magpie")
   const connectionFile = join(dir, "connection.json")
   const stateFile = join(dir, "state.json")
   const connection = await readConnection(connectionFile)
@@ -235,7 +259,14 @@ export async function syncSiyuan(home = siyuanHome, { restoreOnly = false } = {}
   }
   const modelApplied = connection && state?.applied === signature
   if (modelApplied && state.logoVersion === logoVersion) return "connected"
-  const kernel = await locateKernel(home, state?.workspace)
+  // SiYuan's --home-dir selects the base for its .config/siyuan registry.
+  // Magpie's agent manifest still writes its control file in the user's home.
+  const customHome = home === undefined && process.env.SIYUAN_HOME_DIR
+  if (customHome && !isAbsolute(customHome)) {
+    throw new Error("SIYUAN_HOME_DIR 必须是思源 --home-dir 使用的绝对路径")
+  }
+  const registryDir = customHome ? join(customHome, ".config", "siyuan") : controlHome
+  const kernel = await locateKernel(registryDir, state?.workspace)
   if (!modelApplied) {
     const snapshot = await readAI(kernel)
     if (!state) {
@@ -274,7 +305,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.exitCode = 1
   } else {
     try {
-      const result = await syncSiyuan(siyuanHome, { restoreOnly: true })
+      const result = await syncSiyuan(undefined, { restoreOnly: true })
       if (result === "still-connected") {
         console.error("请先在 Magpie 的 Agents 页面断开思源笔记")
         process.exitCode = 1
